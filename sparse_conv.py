@@ -101,28 +101,17 @@ class SparseConv2dFunction(Function):
         
         if ctx.needs_input_grad[1]:
             # Calculate gradient with respect to weight
-            # For sparse inputs, we don't need to compute gradients for zero elements
-            batch_size = input.shape[0]
-            grad_weight = torch.zeros_like(weight)
-            
-            for b in range(batch_size):
-                # Skip if this batch element is all zeros
-                if not (input[b] != 0).any():
-                    continue
-                
-                # Compute weight gradient for non-zero regions
-                input_b = input[b:b+1]
-                grad_output_b = grad_output[b:b+1]
-                
-                # Use conv2d for weight gradient computation (input and grad_output are swapped)
-                for c_out in range(grad_output_b.shape[1]):
-                    for c_in in range(input_b.shape[1]//groups):
-                        g = c_in // (input_b.shape[1] // groups)
-                        grad_weight[c_out, c_in] += F.conv2d(
-                            input_b[:, c_in:c_in+1].transpose(0, 1),
-                            grad_output_b[:, c_out:c_out+1].transpose(0, 1),
-                            None, dilation, padding, stride, 1
-                        )[0, 0]
+            grad_weight = = F.conv2d(
+                            input.transpose(0, 1),
+                            grad_output.transpose(0, 1),
+                            None,
+                            dilation,
+                            padding,
+                            stride,
+                            groups
+                        ).transpose(0, 1)
+
+            grad_weight = grad_weight[:, :, :weight.shape[2], :weight.shape[3]]
         
         if bias is not None and ctx.needs_input_grad[2]:
             # Calculate gradient with respect to bias
@@ -212,8 +201,17 @@ class SparseConvTranspose2dFunction(Function):
         
         if ctx.needs_input_grad[1]:
             # Calculate gradient with respect to weight
-            batch_size = input.shape[0]
-            grad_weight = torch.zeros_like(weight)
+            grad_weight = F.conv2d(
+                            grad_output.transpose(0, 1),
+                            input.transpose(0, 1),
+                            None,
+                            dilation,
+                            padding,
+                            stride,
+                            groups
+                        ).transpose(0, 1)
+
+            grad_weight = grad_weight[:, :, :weight.shape[2], :weight.shape[3]]
             
             for b in range(batch_size):
                 # Skip if this batch element is all zeros
