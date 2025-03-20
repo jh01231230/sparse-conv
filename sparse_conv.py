@@ -101,7 +101,7 @@ class SparseConv2dFunction(Function):
         
         if ctx.needs_input_grad[1]:
             # Calculate gradient with respect to weight
-            grad_weight = = F.conv2d(
+            grad_weight = F.conv2d(
                             input.transpose(0, 1),
                             grad_output.transpose(0, 1),
                             None,
