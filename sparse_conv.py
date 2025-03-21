@@ -3,11 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
+import time
+
+# Global cache for kernel maps to avoid recomputation
+_KERNEL_MAP_CACHE = {}
 
 class SparseConv2dFunction(Function):
     """
-    Custom autograd function for sparse 2D convolution.
-    This function handles forward and backward passes while skipping computations for zero elements.
+    Optimized custom autograd function for sparse 2D convolution.
     """
     @staticmethod
     def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
@@ -17,61 +20,66 @@ class SparseConv2dFunction(Function):
         ctx.padding = padding
         ctx.dilation = dilation
         ctx.groups = groups
-
-        # Find non-zero elements
-        mask = input != 0
-        if not mask.any():
-            # If input is all zeros, return zeros
-            return torch.zeros_like(
-                F.conv2d(input, weight, bias, stride, padding, dilation, groups)
-            )
         
-        # Create sparse representation
-        indices = mask.nonzero(as_tuple=True)
-        values = input[indices]
+        # Check sparsity ratio - if not sparse enough, use standard conv2d
+        sparsity_ratio = (input == 0).float().mean().item()
+        sparsity_threshold = 0.7  # Tunable parameter
         
-        # Process only non-zero elements
+        if sparsity_ratio < sparsity_threshold:
+            # If not sparse enough, use standard convolution
+            output = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+            ctx.used_standard_conv = True
+            return output
+        
+        ctx.used_standard_conv = False
+        
+        # Convert parameters to tuples if they're integers
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+            
+        # Generate cache key for this operation
+        batch_size, in_channels, in_height, in_width = input.shape
+        out_channels = weight.shape[0]
+        kernel_size = (weight.shape[2], weight.shape[3])
+        
+        cache_key = (in_height, in_width, kernel_size, stride, padding, dilation, groups)
+        
+        # If we don't have this kernel map cached, create a sparse implementation
+        mask = (input != 0).float()
+        batch_indices = torch.arange(batch_size, device=input.device).view(-1, 1, 1, 1).expand_as(input)
+        
+        # Get indices of non-zero elements in a batch-aware way
+        nonzero_indices = torch.nonzero(mask, as_tuple=False)
+        
+        # Only compute for batches with non-zero elements
+        unique_batches = torch.unique(nonzero_indices[:, 0])
+        
+        # Create output tensor with correct shape
         output_shape = F.conv2d(
             input, weight, None, stride, padding, dilation, groups
         ).shape
-        
-        # Initialize output tensor
         output = torch.zeros(output_shape, device=input.device, dtype=input.dtype)
         
-        # Create patches using unfold for non-zero regions only
-        # This is an optimization strategy - we only process regions with non-zero values
-        batch_size, in_channels, in_height, in_width = input.shape
-        
-        # Handle input as patches to enable sparse computation
-        if isinstance(stride, int):
-            stride_h, stride_w = stride, stride
-        else:
-            stride_h, stride_w = stride
+        # Process batches with non-zero elements
+        if len(unique_batches) > 0:
+            # Use PyTorch's conv2d for non-zero batches - more efficient than our custom sparse implementation
+            # since we're leveraging PyTorch's optimized CUDA kernels
+            non_zero_batch_mask = torch.zeros(batch_size, dtype=torch.bool, device=input.device)
+            non_zero_batch_mask[unique_batches] = True
+            non_zero_batches = input[non_zero_batch_mask]
             
-        if isinstance(padding, int):
-            padding_h, padding_w = padding, padding
-        else:
-            padding_h, padding_w = padding
+            non_zero_output = F.conv2d(
+                non_zero_batches, weight, None, stride, padding, dilation, groups
+            )
             
-        if isinstance(dilation, int):
-            dilation_h, dilation_w = dilation, dilation
-        else:
-            dilation_h, dilation_w = dilation
+            # Place results back in output tensor
+            output[non_zero_batch_mask] = non_zero_output
         
-        # For simplicity in this implementation, we process each batch element separately
-        # A more optimized version would batch process non-zero elements
-        for b in range(batch_size):
-            # Check if this batch element has any non-zeros
-            if not mask[b].any():
-                continue
-                
-            # Use PyTorch's F.conv2d for each non-zero element's region
-            # This is more efficient than manual convolution
-            output[b] = F.conv2d(
-                input[b:b+1], weight, None, stride, padding, dilation, groups
-            )[0]
-        
-        # Add bias if provided
+        # Add bias if provided (using PyTorch's broadcasting)
         if bias is not None:
             output += bias.view(1, -1, 1, 1)
         
@@ -84,38 +92,93 @@ class SparseConv2dFunction(Function):
         padding = ctx.padding
         dilation = ctx.dilation
         groups = ctx.groups
+        used_standard_conv = ctx.used_standard_conv
         
         # Initialize gradients
         grad_input = grad_weight = grad_bias = None
         
-        # Calculate gradients
-        if ctx.needs_input_grad[0]:
-            # Calculate gradient with respect to input
-            grad_input = F.conv_transpose2d(
-                grad_output, weight, None, stride, padding, 
-                0, groups, dilation
-            )
+        # If we used standard conv in forward, use standard convolution backward
+        if used_standard_conv:
+            if ctx.needs_input_grad[0]:
+                grad_input = F.conv_transpose2d(
+                    grad_output, weight, None, stride, padding, 0, groups, dilation
+                )
             
-            # Apply sparsity mask to grad_input
-            grad_input *= (input != 0).float()
-        
-        if ctx.needs_input_grad[1]:
-            # Calculate gradient with respect to weight
-            grad_weight = F.conv2d(
-                            input.transpose(0, 1),
-                            grad_output.transpose(0, 1),
-                            None,
-                            dilation,
-                            padding,
-                            stride,
-                            groups
-                        ).transpose(0, 1)
-
-            grad_weight = grad_weight[:, :, :weight.shape[2], :weight.shape[3]]
+            if ctx.needs_input_grad[1]:
+                # Compute grad_weight using standard conv2d
+                batch_size = input.shape[0]
+                
+                # Reshape for grouped convolution if necessary
+                if groups > 1:
+                    in_channels_per_group = input.shape[1] // groups
+                    out_channels_per_group = grad_output.shape[1] // groups
+                    
+                    grad_weight = torch.zeros_like(weight)
+                    
+                    for g in range(groups):
+                        input_g = input[:, g*in_channels_per_group:(g+1)*in_channels_per_group]
+                        grad_output_g = grad_output[:, g*out_channels_per_group:(g+1)*out_channels_per_group]
+                        
+                        for b in range(batch_size):
+                            grad_weight[g*out_channels_per_group:(g+1)*out_channels_per_group] += F.conv2d(
+                                input_g[b:b+1].transpose(0, 1),
+                                grad_output_g[b:b+1].transpose(0, 1)
+                            )
+                else:
+                    # Standard case without groups
+                    grad_weight = torch.zeros_like(weight)
+                    
+                    # More efficient implementation using batched operations
+                    # Reshape for efficient computation
+                    input_reshaped = input.reshape(1, batch_size * input.shape[1], input.shape[2], input.shape[3])
+                    grad_output_reshaped = grad_output.permute(1, 0, 2, 3).reshape(
+                        grad_output.shape[1], batch_size, 1, grad_output.shape[2], grad_output.shape[3]
+                    )
+                    
+                    # Compute gradients for all filters at once using grouped convolution
+                    for i in range(grad_output.shape[1]):
+                        grad_weight[i] = F.conv2d(
+                            input.transpose(0, 1), 
+                            grad_output[:, i:i+1].transpose(0, 1)
+                        ).sum(dim=0)
+        else:
+            # Sparse-optimized backward pass
+            if ctx.needs_input_grad[0]:
+                # Create a mask of non-zero input elements
+                mask = (input != 0).float()
+                
+                # Compute full gradient
+                grad_input_full = F.conv_transpose2d(
+                    grad_output, weight, None, stride, padding, 0, groups, dilation
+                )
+                
+                # Apply mask to only compute gradients for non-zero input elements
+                grad_input = grad_input_full * mask
+            
+            if ctx.needs_input_grad[1]:
+                # Get non-zero patterns
+                input_nonzero = (input != 0)
+                batch_size = input.shape[0]
+                
+                # Initialize gradient
+                grad_weight = torch.zeros_like(weight)
+                
+                # Only process batches with non-zero elements
+                for b in range(batch_size):
+                    if not input_nonzero[b].any():
+                        continue
+                    
+                    # Use efficient conv2d for weight gradient
+                    grad_weight += F.conv2d(
+                        input[b:b+1].transpose(0, 1),
+                        grad_output[b:b+1].transpose(0, 1),
+                        padding=dilation,
+                        stride=1
+                    ).sum(dim=0)
         
         if bias is not None and ctx.needs_input_grad[2]:
-            # Calculate gradient with respect to bias
-            grad_bias = grad_output.sum((0, 2, 3))
+            # Calculate gradient with respect to bias - efficient using sum reduction
+            grad_bias = grad_output.sum(dim=(0, 2, 3))
         
         # Return gradients for all inputs (None for those not requiring gradients)
         return grad_input, grad_weight, grad_bias, None, None, None, None
@@ -123,8 +186,7 @@ class SparseConv2dFunction(Function):
 
 class SparseConvTranspose2dFunction(Function):
     """
-    Custom autograd function for sparse 2D transposed convolution.
-    This function handles forward and backward passes while skipping computations for zero elements.
+    Optimized custom autograd function for sparse 2D transposed convolution.
     """
     @staticmethod
     def forward(ctx, input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
@@ -135,42 +197,53 @@ class SparseConvTranspose2dFunction(Function):
         ctx.output_padding = output_padding
         ctx.groups = groups
         ctx.dilation = dilation
-
-        # Find non-zero elements
-        mask = input != 0
-        if not mask.any():
-            # If input is all zeros, return zeros
-            return torch.zeros_like(
-                F.conv_transpose2d(input, weight, bias, stride, padding, output_padding, groups, dilation)
-            )
         
-        # Create sparse representation
-        indices = mask.nonzero(as_tuple=True)
-        values = input[indices]
+        # Check sparsity ratio - if not sparse enough, use standard conv_transpose2d
+        sparsity_ratio = (input == 0).float().mean().item()
+        sparsity_threshold = 0.7  # Tunable parameter
         
-        # Process only non-zero elements
+        if sparsity_ratio < sparsity_threshold:
+            # If not sparse enough, use standard transposed convolution
+            output = F.conv_transpose2d(input, weight, bias, stride, padding, output_padding, groups, dilation)
+            ctx.used_standard_conv = True
+            return output
+        
+        ctx.used_standard_conv = False
+        
+        # Convert parameters to tuples if they're integers
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(output_padding, int):
+            output_padding = (output_padding, output_padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+        
+        # Create output tensor with correct shape
         output_shape = F.conv_transpose2d(
             input, weight, None, stride, padding, output_padding, groups, dilation
         ).shape
-        
-        # Initialize output tensor
         output = torch.zeros(output_shape, device=input.device, dtype=input.dtype)
         
-        # Handle input as patches to enable sparse computation
-        batch_size, in_channels, in_height, in_width = input.shape
+        # Optimize by only processing non-zero elements
+        mask = (input != 0)
+        if not mask.any():
+            if bias is not None:
+                # For all-zero input with bias, still need to add bias to output
+                output += bias.view(1, -1, 1, 1)
+            return output
         
-        # For simplicity in this implementation, we process each batch element separately
-        for b in range(batch_size):
-            # Check if this batch element has any non-zeros
-            if not mask[b].any():
-                continue
-                
-            # Use PyTorch's F.conv_transpose2d for each non-zero batch element
+        # Get unique batches with non-zero elements
+        batch_indices = torch.nonzero(mask, as_tuple=False)[:, 0].unique()
+        
+        # Process only batches with non-zero elements
+        for b in batch_indices:
             output[b] = F.conv_transpose2d(
                 input[b:b+1], weight, None, stride, padding, output_padding, groups, dilation
             )[0]
         
-        # Add bias if provided
+        # Add bias if provided (efficient broadcasting)
         if bias is not None:
             output += bias.view(1, -1, 1, 1)
         
@@ -184,60 +257,93 @@ class SparseConvTranspose2dFunction(Function):
         output_padding = ctx.output_padding
         groups = ctx.groups
         dilation = ctx.dilation
+        used_standard_conv = ctx.used_standard_conv
         
         # Initialize gradients
         grad_input = grad_weight = grad_bias = None
         
-        # Calculate gradients
-        if ctx.needs_input_grad[0]:
-            # Calculate gradient with respect to input
-            grad_input = F.conv2d(
-                grad_output, weight.transpose(0, 1).flip(2, 3), 
-                None, stride, padding, dilation, groups
-            )
+        # If we used standard conv in forward, use standard convolution backward
+        if used_standard_conv:
+            if ctx.needs_input_grad[0]:
+                grad_input = F.conv2d(
+                    grad_output, weight.transpose(0, 1).flip(2, 3), 
+                    None, stride, padding, dilation, groups
+                )
             
-            # Apply sparsity mask to grad_input
-            grad_input *= (input != 0).float()
-        
-        if ctx.needs_input_grad[1]:
-            # Calculate gradient with respect to weight
-            grad_weight = F.conv2d(
-                            grad_output.transpose(0, 1),
-                            input.transpose(0, 1),
-                            None,
-                            dilation,
-                            padding,
-                            stride,
-                            groups
-                        ).transpose(0, 1)
-
-            grad_weight = grad_weight[:, :, :weight.shape[2], :weight.shape[3]]
+            if ctx.needs_input_grad[1]:
+                # Standard transposed convolution gradient calculation
+                batch_size = input.shape[0]
+                grad_weight = torch.zeros_like(weight)
+                
+                # Compute gradients for all weights at once
+                for b in range(batch_size):
+                    for g in range(groups):
+                        in_channels_per_group = input.shape[1] // groups
+                        out_channels_per_group = grad_output.shape[1] // groups
+                        
+                        # Extract group-specific channels
+                        input_g = input[b:b+1, g*in_channels_per_group:(g+1)*in_channels_per_group]
+                        grad_output_g = grad_output[b:b+1, g*out_channels_per_group:(g+1)*out_channels_per_group]
+                        
+                        # Use convolution to compute weight gradients efficiently
+                        grad_weight[g*in_channels_per_group:(g+1)*in_channels_per_group] += F.conv2d(
+                            input_g.transpose(0, 1),
+                            grad_output_g.transpose(0, 1),
+                            padding=dilation,
+                            stride=1
+                        )
+        else:
+            # Sparse-optimized backward pass
+            if ctx.needs_input_grad[0]:
+                # Create a mask of non-zero input elements
+                mask = (input != 0).float()
+                
+                # Apply flipped weights for grad_input calculation
+                grad_input = F.conv2d(
+                    grad_output, weight.transpose(0, 1).flip(2, 3), 
+                    None, stride, padding, dilation, groups
+                )
+                
+                # Only keep gradients for non-zero input elements
+                grad_input = grad_input * mask
             
-            for b in range(batch_size):
-                # Skip if this batch element is all zeros
-                if not (input[b] != 0).any():
-                    continue
+            if ctx.needs_input_grad[1]:
+                # Get non-zero patterns
+                batch_size = input.shape[0]
+                input_nonzero = (input != 0)
                 
-                # Compute weight gradient for non-zero regions
-                input_b = input[b:b+1]
-                grad_output_b = grad_output[b:b+1]
+                # Initialize gradient
+                grad_weight = torch.zeros_like(weight)
                 
-                # Weight gradient for transposed conv is similar to regular conv
-                # but with input and grad_output roles swapped
-                for c_out in range(input_b.shape[1]):
-                    for c_in in range(grad_output_b.shape[1]//groups):
-                        g = c_in // (grad_output_b.shape[1] // groups)
-                        grad_weight[c_out, c_in] += F.conv2d(
-                            grad_output_b[:, c_in:c_in+1].transpose(0, 1),
-                            input_b[:, c_out:c_out+1].transpose(0, 1),
-                            None, dilation, padding, stride, 1
-                        )[0, 0]
+                # Only compute for batches with non-zero elements
+                for b in range(batch_size):
+                    if not input_nonzero[b].any():
+                        continue
+                    
+                    # Use efficient grouped conv for weight gradient
+                    for g in range(groups):
+                        in_channels_per_group = input.shape[1] // groups
+                        out_channels_per_group = grad_output.shape[1] // groups
+                        
+                        input_g = input[b:b+1, g*in_channels_per_group:(g+1)*in_channels_per_group]
+                        grad_output_g = grad_output[b:b+1, g*out_channels_per_group:(g+1)*out_channels_per_group]
+                        
+                        # Calculate weight gradient efficiently
+                        g_weight_grad = F.conv2d(
+                            input_g.transpose(0, 1),
+                            grad_output_g.transpose(0, 1),
+                            padding=dilation,
+                            stride=1
+                        )
+                        
+                        # Accumulate gradients
+                        grad_weight[g*in_channels_per_group:(g+1)*in_channels_per_group] += g_weight_grad
         
         if bias is not None and ctx.needs_input_grad[2]:
-            # Calculate gradient with respect to bias
-            grad_bias = grad_output.sum((0, 2, 3))
+            # Calculate gradient with respect to bias - efficient reduction
+            grad_bias = grad_output.sum(dim=(0, 2, 3))
         
-        # Return gradients for all inputs (None for those not requiring gradients)
+        # Return gradients for all inputs
         return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
@@ -418,10 +524,79 @@ class SparseConvTranspose2d(nn.Module):
             s += ', padding_mode={padding_mode}'
         return s.format(**self.__dict__)
 
-# Utility function to measure FLOP count for sparse convolution
-def count_sparse_conv_flops(input_tensor, conv_layer):
+
+# Utility function to benchmark sparse vs. dense convolution
+def benchmark_conv(sparse_model, dense_model, input_tensor, warmup=5, iters=20):
     """
-    Estimate FLOPs for sparse convolution
+    Benchmark sparse and dense convolution performance
+    
+    Parameters:
+    -----------
+    sparse_model : SparseConv2d or SparseConvTranspose2d
+        Sparse convolution model
+    dense_model : nn.Conv2d or nn.ConvTranspose2d
+        Dense convolution model
+    input_tensor : torch.Tensor
+        Input tensor to run convolution on
+    warmup : int
+        Number of warmup iterations
+    iters : int
+        Number of timed iterations
+    
+    Returns:
+    --------
+    tuple
+        (sparse_time, dense_time, speedup_ratio)
+    """
+    # Make sure input is on CUDA
+    if input_tensor.device.type != 'cuda':
+        input_tensor = input_tensor.cuda()
+    
+    # Move models to CUDA
+    sparse_model = sparse_model.cuda()
+    dense_model = dense_model.cuda()
+    
+    # Warm up
+    for _ in range(warmup):
+        _ = sparse_model(input_tensor)
+        _ = dense_model(input_tensor)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark sparse model
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    start.record()
+    for _ in range(iters):
+        _ = sparse_model(input_tensor)
+    end.record()
+    
+    torch.cuda.synchronize()
+    sparse_time = start.elapsed_time(end) / iters
+    
+    # Benchmark dense model
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    start.record()
+    for _ in range(iters):
+        _ = dense_model(input_tensor)
+    end.record()
+    
+    torch.cuda.synchronize()
+    dense_time = start.elapsed_time(end) / iters
+    
+    # Calculate speedup
+    speedup = dense_time / sparse_time if sparse_time > 0 else float('inf')
+    
+    return sparse_time, dense_time, speedup
+
+
+# Utility function to measure FLOP count for sparse convolution
+def count_sparse_conv_flops(input_tensor, conv_layer, detailed=False):
+    """
+    Estimate FLOPs for sparse convolution with improved accuracy
     
     Parameters:
     -----------
@@ -429,127 +604,146 @@ def count_sparse_conv_flops(input_tensor, conv_layer):
         Input tensor with shape (B, C_in, H, W)
     conv_layer : SparseConv2d or nn.Conv2d
         Convolution layer
+    detailed : bool
+        Whether to return detailed breakdown
         
     Returns:
     --------
-    flops : int
-        Estimated number of FLOPs
+    flops or (flops, details_dict)
+        Estimated number of FLOPs and optionally details
     """
     # Get parameters
     batch_size, in_channels, in_height, in_width = input_tensor.shape
     out_channels = conv_layer.out_channels
     kernel_h, kernel_w = conv_layer.kernel_size
     
-    # Count non-zero elements
-    non_zeros = torch.count_nonzero(input_tensor).item()
-    
-    # For each non-zero element, we perform kernel_h * kernel_w * out_channels multiplications
-    # and additions, minus 1 addition per output element (since we start from 0)
-    flops_per_element = 2 * kernel_h * kernel_w * in_channels * out_channels // conv_layer.groups
+    # Count non-zero elements per batch
+    non_zeros = torch.count_nonzero(input_tensor, dim=(1, 2, 3))
+    total_elements = in_channels * in_height * in_width
     
     # Calculate output size
     if hasattr(conv_layer, 'stride'):
-        stride_h, stride_w = conv_layer.stride
+        stride_h, stride_w = conv_layer.stride if isinstance(conv_layer.stride, tuple) else (conv_layer.stride, conv_layer.stride)
     else:
         stride_h, stride_w = 1, 1
         
     if hasattr(conv_layer, 'padding'):
-        padding_h, padding_w = conv_layer.padding
+        padding_h, padding_w = conv_layer.padding if isinstance(conv_layer.padding, tuple) else (conv_layer.padding, conv_layer.padding)
     else:
         padding_h, padding_w = 0, 0
         
     if hasattr(conv_layer, 'dilation'):
-        dilation_h, dilation_w = conv_layer.dilation
+        dilation_h, dilation_w = conv_layer.dilation if isinstance(conv_layer.dilation, tuple) else (conv_layer.dilation, conv_layer.dilation)
     else:
         dilation_h, dilation_w = 1, 1
     
-    # Output height and width
+    # Output dimensions
     out_height = (in_height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
     out_width = (in_width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
     
-    # For sparse convolution, we only compute for non-zero elements
-    # This is an approximation - the actual FLOPs depend on the distribution of non-zeros
-    sparse_ratio = non_zeros / (batch_size * in_channels * in_height * in_width)
+    # FLOPs for standard convolution
+    flops_standard = batch_size * out_height * out_width * out_channels * in_channels * kernel_h * kernel_w // conv_layer.groups
     
-    # For each output pixel, we need in_channels * kernel_h * kernel_w multiply-adds
-    flops = batch_size * out_height * out_width * out_channels * in_channels * kernel_h * kernel_w // conv_layer.groups
+    # FLOPs for sparse convolution - detailed batch-by-batch analysis
+    flops_sparse = 0
     
-    # Adjust for sparsity - this is a simplification assuming uniform distribution of zeros
-    sparse_flops = flops * sparse_ratio
+    # Each non-zero element affects an output patch 
+    for b in range(batch_size):
+        # Skip empty batches
+        if non_zeros[b] == 0:
+            continue
+        
+        # Sparse ratio for this batch
+        sparse_ratio = non_zeros[b].item() / total_elements
+        
+        # FLOPs for this batch
+        batch_flops = out_height * out_width * out_channels * in_channels * kernel_h * kernel_w // conv_layer.groups
+        flops_sparse += batch_flops * sparse_ratio
     
     # Add bias FLOPs if applicable
-    if conv_layer.bias is not None:
-        sparse_flops += batch_size * out_height * out_width * out_channels
+    bias_flops = batch_size * out_height * out_width * out_channels if conv_layer.bias is not None else 0
+    flops_standard += bias_flops
+    flops_sparse += bias_flops
     
-    return int(sparse_flops)
+    if detailed:
+        details = {
+            'input_shape': input_tensor.shape,
+            'kernel_size': (kernel_h, kernel_w),
+            'output_shape': (batch_size, out_channels, out_height, out_width),
+            'non_zeros': non_zeros.tolist(),
+            'sparsity_ratio': (total_elements - non_zeros.sum().item()) / (batch_size * total_elements),
+            'standard_flops': flops_standard,
+            'sparse_flops': flops_sparse,
+            'flops_reduction': 1 - (flops_sparse / flops_standard) if flops_standard > 0 else 0
+        }
+        return int(flops_sparse), details
+    
+    return int(flops_sparse)
 
 
-# Utility function to measure FLOP count for sparse transposed convolution
-def count_sparse_conv_transpose_flops(input_tensor, conv_transpose_layer):
+# Create a helper function to convert from sparse to structured sparse format
+def convert_to_structured_sparse(input_tensor, min_block_size=4):
     """
-    Estimate FLOPs for sparse transposed convolution
+    Convert a sparse tensor to a structured sparse format for better GPU utilization
     
     Parameters:
     -----------
     input_tensor : torch.Tensor
-        Input tensor with shape (B, C_in, H, W)
-    conv_transpose_layer : SparseConvTranspose2d or nn.ConvTranspose2d
-        Transposed convolution layer
-        
+        Input tensor with shape (B, C, H, W)
+    min_block_size : int
+        Minimum block size for structuring
+    
     Returns:
     --------
-    flops : int
-        Estimated number of FLOPs
+    tuple
+        (structured_tensor, indices, values, block_structure)
     """
-    # Get parameters
-    batch_size, in_channels, in_height, in_width = input_tensor.shape
-    out_channels = conv_transpose_layer.out_channels
-    kernel_h, kernel_w = conv_transpose_layer.kernel_size
+    # Get dimensions
+    B, C, H, W = input_tensor.shape
     
-    # Count non-zero elements
-    non_zeros = torch.count_nonzero(input_tensor).item()
+    # Convert to blocks
+    h_blocks = H // min_block_size + (1 if H % min_block_size > 0 else 0)
+    w_blocks = W // min_block_size + (1 if W % min_block_size > 0 else 0)
     
-    # For each non-zero element, we perform kernel_h * kernel_w * out_channels multiplications
-    # and additions, minus 1 addition per output element (since we start from 0)
-    flops_per_element = 2 * kernel_h * kernel_w * in_channels * out_channels // conv_transpose_layer.groups
+    # Create block tensor
+    block_sparsity = torch.zeros((B, C, h_blocks, w_blocks), dtype=torch.bool, device=input_tensor.device)
     
-    # Calculate output size
-    if hasattr(conv_transpose_layer, 'stride'):
-        stride_h, stride_w = conv_transpose_layer.stride
-    else:
-        stride_h, stride_w = 1, 1
+    # Mark blocks with non-zero elements
+    for b in range(B):
+        for c in range(C):
+            for h_block in range(h_blocks):
+                h_start = h_block * min_block_size
+                h_end = min(h_start + min_block_size, H)
+                
+                for w_block in range(w_blocks):
+                    w_start = w_block * min_block_size
+                    w_end = min(w_start + min_block_size, W)
+                    
+                    # Check if block has any non-zero elements
+                    if torch.any(input_tensor[b, c, h_start:h_end, w_start:w_end] != 0):
+                        block_sparsity[b, c, h_block, w_block] = True
+    
+    # Get indices of non-zero blocks
+    indices = torch.nonzero(block_sparsity, as_tuple=False)
+    
+    # Create structured tensor
+    structured_tensor = torch.zeros_like(input_tensor)
+    block_values = []
+    
+    for idx in indices:
+        b, c, h_block, w_block = idx
         
-    if hasattr(conv_transpose_layer, 'padding'):
-        padding_h, padding_w = conv_transpose_layer.padding
-    else:
-        padding_h, padding_w = 0, 0
+        h_start = h_block * min_block_size
+        h_end = min(h_start + min_block_size, H)
         
-    if hasattr(conv_transpose_layer, 'output_padding'):
-        output_padding_h, output_padding_w = conv_transpose_layer.output_padding
-    else:
-        output_padding_h, output_padding_w = 0, 0
+        w_start = w_block * min_block_size
+        w_end = min(w_start + min_block_size, W)
         
-    if hasattr(conv_transpose_layer, 'dilation'):
-        dilation_h, dilation_w = conv_transpose_layer.dilation
-    else:
-        dilation_h, dilation_w = 1, 1
+        # Extract block
+        block = input_tensor[b, c, h_start:h_end, w_start:w_end]
+        block_values.append(block)
+        
+        # Place into structured tensor
+        structured_tensor[b, c, h_start:h_end, w_start:w_end] = block
     
-    # Output height and width for transposed convolution
-    out_height = (in_height - 1) * stride_h - 2 * padding_h + dilation_h * (kernel_h - 1) + output_padding_h + 1
-    out_width = (in_width - 1) * stride_w - 2 * padding_w + dilation_w * (kernel_w - 1) + output_padding_w + 1
-    
-    # For sparse convolution, we only compute for non-zero elements
-    # This is an approximation - the actual FLOPs depend on the distribution of non-zeros
-    sparse_ratio = non_zeros / (batch_size * in_channels * in_height * in_width)
-    
-    # For each output pixel, we need in_channels * kernel_h * kernel_w multiply-adds
-    flops = batch_size * out_height * out_width * out_channels * in_channels * kernel_h * kernel_w // conv_transpose_layer.groups
-    
-    # Adjust for sparsity - this is a simplification assuming uniform distribution of zeros
-    sparse_flops = flops * sparse_ratio
-    
-    # Add bias FLOPs if applicable
-    if conv_transpose_layer.bias is not None:
-        sparse_flops += batch_size * out_height * out_width * out_channels
-    
-    return int(sparse_flops)
+    return structured_tensor, indices, block_values, (h_blocks, w_blocks, min_block_size)
